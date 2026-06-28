@@ -153,6 +153,49 @@ Output only the update text — no subject line, no preamble."""
     return msg.content[0].text.strip()
 
 # ---------------------------------------------------------------------------
+# Draft DM helpers
+# ---------------------------------------------------------------------------
+
+# Daryna's Slack user ID
+MY_SLACK_USER_ID = "U09HMBN9C6S"
+
+
+def send_draft_dm(slack_client: WebClient, drafts: list):
+    """Send all role drafts as a single DM to Daryna for review."""
+    today = datetime.now().strftime("%d %b %Y")
+    header = f":memo: *Weekly Update Drafts — {today}*\nReview below and post to Asana + Slack when ready.\n"
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header},
+        },
+        {"type": "divider"},
+    ]
+
+    for d in drafts:
+        label = d["task_name"].split(".", 2)[-1].strip() if "." in d["task_name"] else d["task_name"]
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{label}*\n"
+                    f"_Post to:_ #{d['channel']}  |  <{d['task_url']}|Asana task>\n\n"
+                    f"{d['update']}"
+                ),
+            },
+        })
+        blocks.append({"type": "divider"})
+
+    slack_client.chat_postMessage(
+        channel=MY_SLACK_USER_ID,
+        text=f"Weekly Update Drafts — {today}",  # fallback for notifications
+        blocks=blocks,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -167,26 +210,33 @@ def validate_env():
 def main():
     parser = argparse.ArgumentParser(description="Generate weekly recruiting updates")
     parser.add_argument("--days", type=int, default=7, help="Days of history to include (default: 7)")
-    parser.add_argument("--post", action="store_true", help="Publish updates to Asana + Slack (default: dry run)")
+    parser.add_argument("--draft", action="store_true", help="Send all drafts to your Slack DM for review")
+    parser.add_argument("--post", action="store_true", help="Publish updates to Asana + Slack directly")
     parser.add_argument("--task", type=str, help="Run for a single Asana task ID only")
     args = parser.parse_args()
 
     validate_env()
 
     anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    slack_client = WebClient(token=SLACK_BOT_TOKEN) if args.post else None
+    slack_client = WebClient(token=SLACK_BOT_TOKEN) if (args.draft or args.post) else None
 
-    mode = "LIVE" if args.post else "DRY RUN"
+    if args.draft:
+        mode = "DRAFT → DM"
+    elif args.post:
+        mode = "LIVE PUBLISH"
+    else:
+        mode = "DRY RUN (terminal preview only)"
+
     print(f"[{mode}] Weekly Update Generator — looking back {args.days} days\n")
     print("=" * 60)
 
     tasks = [get_task(args.task)] if args.task else get_active_tasks()
-    processed = 0
+    drafts = []
 
     for task in tasks:
         country_key = extract_country_key(task["name"])
         if not country_key:
-            continue  # no channel mapping — skip silently
+            continue
 
         channel = CHANNEL_MAP[country_key]
         task_url = (
@@ -212,16 +262,23 @@ def main():
         if args.post:
             asana_post_comment(task["gid"], update)
             print("Posted to Asana.")
-
             try:
                 post_to_slack(slack_client, channel, task["name"], update, task_url)
                 print(f"Posted to Slack #{channel}.")
             except SlackApiError as e:
                 print(f"Slack error for #{channel}: {e.response['error']}")
 
-        processed += 1
+        drafts.append({"task_name": task["name"], "channel": channel, "task_url": task_url, "update": update})
 
     print("\n" + "=" * 60)
-    print(f"Done. {processed} role(s) processed.")
-    if not args.post:
-        print("\nReview the previews above, then run with --post to publish.")
+    print(f"Done. {len(drafts)} role(s) processed.")
+
+    if args.draft and drafts:
+        print("\nSending all drafts to your Slack DM...")
+        try:
+            send_draft_dm(slack_client, drafts)
+            print("Drafts sent to your Slack DM.")
+        except SlackApiError as e:
+            print(f"Slack DM error: {e.response['error']}")
+    elif not args.post and not args.draft:
+        print("\nRun with --draft to receive drafts in your Slack DM, or --post to publish directly.")
